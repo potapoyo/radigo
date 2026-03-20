@@ -69,6 +69,10 @@ func getTimeshiftPlaylistM3U8(ctx context.Context, client *radiko.Client, statio
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("timefree playlist request failed: HTTP %d", resp.StatusCode)
+	}
+
 	return parseMasterM3U8URI(resp.Body)
 }
 
@@ -111,9 +115,20 @@ func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, statio
 // parseMasterM3U8URI extracts the first stream URI from a master M3U8 playlist.
 func parseMasterM3U8URI(r io.Reader) (string, error) {
 	scanner := bufio.NewScanner(r)
+	valid := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
+			continue
+		}
+		if !valid {
+			if !strings.HasPrefix(line, "#EXTM3U") {
+				return "", fmt.Errorf("invalid playlist response: %q", line)
+			}
+			valid = true
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
 			continue
 		}
 		return line, nil
