@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,21 @@ import (
 	"github.com/yyoshiki41/go-radiko"
 )
 
-const timefreePlaylistEndpoint = "https://tf-rpaa.smartstream.ne.jp/tf/playlist.m3u8"
+const (
+	// fallback endpoint if station stream XML lookup fails
+	timefreePlaylistEndpoint = "https://tf-f-rpaa-radiko.smartstream.ne.jp/tf/playlist.m3u8"
+	stationStreamXMLBase     = "https://radiko.jp/v3/station/stream/pc_html5/"
+)
+
+type stationStreamData struct {
+	URLs []stationStreamURL `xml:"url"`
+}
+
+type stationStreamURL struct {
+	Arefree           string `xml:"areafree,attr"`
+	Timefree          string `xml:"timefree,attr"`
+	PlaylistCreateURL string `xml:"playlist_create_url"`
+}
 
 // getTimeshiftPlaylistM3U8 returns the media playlist URI for a timeshift program.
 // This replaces the broken TimeshiftPlaylistM3U8 in go-radiko, which relied on
@@ -24,10 +39,11 @@ func getTimeshiftPlaylistM3U8(ctx context.Context, client *radiko.Client, statio
 		return "", err
 	}
 
+	endpoint := discoverTimefreeEndpoint(ctx, client, stationID)
 	lsid := randomHex(16)
 	url := fmt.Sprintf(
-		"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&l=15&lsid=%s&type=b",
-		timefreePlaylistEndpoint,
+		"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&preroll=2&l=15&lsid=%s&type=b",
+		endpoint,
 		stationID,
 		prog.Ft, prog.Ft,
 		prog.To, prog.To,
@@ -39,6 +55,13 @@ func getTimeshiftPlaylistM3U8(ctx context.Context, client *radiko.Client, statio
 		return "", err
 	}
 	req.Header.Set("X-Radiko-AuthToken", client.AuthToken())
+	req.Header.Set("X-Radiko-AreaId", client.AreaID())
+	req.Header.Set("X-Radiko-App", "pc_html5")
+	req.Header.Set("X-Radiko-App-Version", "0.0.1")
+	req.Header.Set("X-Radiko-User", "test-stream")
+	req.Header.Set("X-Radiko-Device", "pc")
+	req.Header.Set("Origin", "https://radiko.jp")
+	req.Header.Set("Referer", "https://radiko.jp/")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -47,6 +70,42 @@ func getTimeshiftPlaylistM3U8(ctx context.Context, client *radiko.Client, statio
 	defer resp.Body.Close()
 
 	return parseMasterM3U8URI(resp.Body)
+}
+
+// discoverTimefreeEndpoint fetches the station stream XML to find the correct
+// timefree playlist creation URL. Falls back to the known default on error.
+func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, stationID string) string {
+	xmlURL := stationStreamXMLBase + stationID + ".xml"
+	req, err := http.NewRequestWithContext(ctx, "GET", xmlURL, nil)
+	if err != nil {
+		return timefreePlaylistEndpoint
+	}
+	req.Header.Set("X-Radiko-AuthToken", client.AuthToken())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return timefreePlaylistEndpoint
+	}
+	defer resp.Body.Close()
+
+	var data stationStreamData
+	if err := xml.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return timefreePlaylistEndpoint
+	}
+
+	// Prefer timefree=1, areafree=0 (non-premium area-free)
+	for _, u := range data.URLs {
+		if u.Timefree == "1" && u.Arefree == "0" && u.PlaylistCreateURL != "" {
+			return u.PlaylistCreateURL
+		}
+	}
+	// Fallback to any timefree URL
+	for _, u := range data.URLs {
+		if u.Timefree == "1" && u.PlaylistCreateURL != "" {
+			return u.PlaylistCreateURL
+		}
+	}
+	return timefreePlaylistEndpoint
 }
 
 // parseMasterM3U8URI extracts the first stream URI from a master M3U8 playlist.
