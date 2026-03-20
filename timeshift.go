@@ -78,13 +78,19 @@ func getTimeshiftPlaylistM3U8(ctx context.Context, client *radiko.Client, statio
 
 // discoverTimefreeEndpoint fetches the station stream XML to find the correct
 // timefree playlist creation URL. Falls back to the known default on error.
+// When accessing a station outside the current area (premium area-free),
+// it prefers areafree=1 CDN endpoints.
 func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, stationID string) string {
+	// needsAreaFree is true when the client area was overridden (premium area-free access)
+	needsAreaFree := client.AreaID() != "" && client.AreaID() != currentAreaID
+
 	xmlURL := stationStreamXMLBase + stationID + ".xml"
 	req, err := http.NewRequestWithContext(ctx, "GET", xmlURL, nil)
 	if err != nil {
 		return timefreePlaylistEndpoint
 	}
 	req.Header.Set("X-Radiko-AuthToken", client.AuthToken())
+	req.Header.Set("X-Radiko-AreaId", client.AreaID())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -97,17 +103,25 @@ func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, statio
 		return timefreePlaylistEndpoint
 	}
 
-	// Prefer timefree=1, areafree=0 (non-premium area-free)
+	var fallback string
 	for _, u := range data.URLs {
-		if u.Timefree == "1" && u.Arefree == "0" && u.PlaylistCreateURL != "" {
+		if u.Timefree != "1" || u.PlaylistCreateURL == "" {
+			continue
+		}
+		if needsAreaFree && u.Arefree == "1" {
+			// Premium area-free: use the areafree=1 CDN endpoint
 			return u.PlaylistCreateURL
+		}
+		if !needsAreaFree && u.Arefree == "0" {
+			// Normal in-area: use the areafree=0 endpoint
+			return u.PlaylistCreateURL
+		}
+		if fallback == "" {
+			fallback = u.PlaylistCreateURL
 		}
 	}
-	// Fallback to any timefree URL
-	for _, u := range data.URLs {
-		if u.Timefree == "1" && u.PlaylistCreateURL != "" {
-			return u.PlaylistCreateURL
-		}
+	if fallback != "" {
+		return fallback
 	}
 	return timefreePlaylistEndpoint
 }
