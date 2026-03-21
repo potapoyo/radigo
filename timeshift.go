@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -237,12 +238,29 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 			return nil, fmt.Errorf("chunklist ft=%s: %w", seekStr, err)
 		}
 
+		newCount := 0
 		for _, seg := range segments {
 			if !seen[seg] {
 				seen[seg] = true
 				chunklist = append(chunklist, seg)
+				newCount++
 			}
 		}
+
+		firstSeg := ""
+		if len(segments) > 0 {
+			firstSeg = segments[0]
+		}
+		uriLen := 80
+		if len(mediaURI) < uriLen {
+			uriLen = len(mediaURI)
+		}
+		segLen := 80
+		if len(firstSeg) < segLen {
+			segLen = len(firstSeg)
+		}
+		fmt.Fprintf(os.Stderr, "[debug] ft=%s mediaURI=%s segs=%d new=%d first=%s\n",
+			seekStr, mediaURI[:uriLen], len(segments), newCount, firstSeg[:segLen])
 	}
 
 	if len(chunklist) == 0 {
