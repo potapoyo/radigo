@@ -159,6 +159,96 @@ func parseMasterM3U8URI(r io.Reader) (string, error) {
 	return "", fmt.Errorf("no URI found in master playlist")
 }
 
+// getTimeshiftChunklist collects all HLS segment URLs for a full timefree program
+// by iterating through seek windows from program start to end.
+// It replaces the single-call approach (getTimeshiftPlaylistM3U8 + GetChunklistFromM3U8)
+// which only returned the first ~windowSeconds of content.
+func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID string, start time.Time) ([]string, error) {
+	prog, err := client.GetProgramByStartTime(ctx, stationID, start)
+	if err != nil {
+		return nil, err
+	}
+
+	needsAreaFree := client.AreaID() != "" && client.AreaID() != currentAreaID
+	streamType := "b"
+	if needsAreaFree {
+		streamType = "c"
+	}
+	areaID := client.AreaID()
+	if needsAreaFree {
+		areaID = currentAreaID
+	}
+
+	endpoint := discoverTimefreeEndpoint(ctx, client, stationID)
+
+	ftTime, err := time.ParseInLocation(datetimeLayout, prog.Ft, location)
+	if err != nil {
+		return nil, fmt.Errorf("parse ft %q: %w", prog.Ft, err)
+	}
+	toTime, err := time.ParseInLocation(datetimeLayout, prog.To, location)
+	if err != nil {
+		return nil, fmt.Errorf("parse to %q: %w", prog.To, err)
+	}
+
+	const windowSecs = 15 * 60 // 15-minute seek windows
+
+	seen := make(map[string]bool)
+	var chunklist []string
+
+	for seek := ftTime; seek.Before(toTime); seek = seek.Add(windowSecs * time.Second) {
+		seekStr := seek.Format(datetimeLayout)
+		masterURL := fmt.Sprintf(
+			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&l=%d&lsid=%s&type=%s",
+			endpoint, stationID,
+			prog.Ft, seekStr,
+			prog.To, prog.To,
+			windowSecs,
+			randomHex(16),
+			streamType,
+		)
+
+		req, err := http.NewRequestWithContext(ctx, "GET", masterURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-Radiko-AuthToken", client.AuthToken())
+		req.Header.Set("X-Radiko-AreaId", areaID)
+		req.Header.Set("X-Radiko-App", "pc_html5")
+		req.Header.Set("X-Radiko-App-Version", "0.0.1")
+		req.Header.Set("X-Radiko-User", "test-stream")
+		req.Header.Set("X-Radiko-Device", "pc")
+		req.Header.Set("Origin", "https://radiko.jp")
+		req.Header.Set("Referer", "https://radiko.jp/")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		mediaURI, parseErr := parseMasterM3U8URI(resp.Body)
+		resp.Body.Close()
+		if parseErr != nil {
+			return nil, fmt.Errorf("window ft=%s: %w", seekStr, parseErr)
+		}
+
+		segments, err := radiko.GetChunklistFromM3U8(mediaURI)
+		if err != nil {
+			return nil, fmt.Errorf("chunklist ft=%s: %w", seekStr, err)
+		}
+
+		for _, seg := range segments {
+			if !seen[seg] {
+				seen[seg] = true
+				chunklist = append(chunklist, seg)
+			}
+		}
+	}
+
+	if len(chunklist) == 0 {
+		return nil, fmt.Errorf("no segments found for %s %s-%s", stationID, prog.Ft, prog.To)
+	}
+	return chunklist, nil
+}
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	rand.Read(b)
