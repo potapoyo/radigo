@@ -190,7 +190,9 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 		return nil, fmt.Errorf("parse to %q: %w", prog.To, err)
 	}
 
-	const windowSecs = 15 * 60 // 15-minute seek windows
+	// l=15 matches the server's supported window size (15 seconds per request).
+	// Larger values cause the server to return an empty playlist.
+	const windowSecs = 15
 
 	seen := make(map[string]bool)
 	var chunklist []string
@@ -198,7 +200,7 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 	for seek := ftTime; seek.Before(toTime); seek = seek.Add(windowSecs * time.Second) {
 		seekStr := seek.Format(datetimeLayout)
 		masterURL := fmt.Sprintf(
-			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&l=%d&lsid=%s&type=%s",
+			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&preroll=2&l=%d&lsid=%s&type=%s",
 			endpoint, stationID,
 			prog.Ft, seekStr,
 			prog.To, prog.To,
