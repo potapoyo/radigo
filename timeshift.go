@@ -175,8 +175,10 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 	var chunklist []string
 	stalled := 0
 
+	pollCount := 0
 	for {
-		segs, closed, err := fetchMedialistSegments(ctx, mediaURI)
+		segs, closed, err := fetchMedialistSegments(ctx, mediaURI, pollCount == 0)
+		pollCount++
 		if err != nil {
 			return nil, err
 		}
@@ -221,7 +223,7 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 
 // fetchMedialistSegments fetches a media playlist and returns its segment URLs
 // and whether #EXT-X-ENDLIST was present.
-func fetchMedialistSegments(ctx context.Context, uri string) (segments []string, closed bool, err error) {
+func fetchMedialistSegments(ctx context.Context, uri string, debugFirst bool) (segments []string, closed bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
 		return nil, false, err
@@ -234,8 +236,13 @@ func fetchMedialistSegments(ctx context.Context, uri string) (segments []string,
 
 	scanner := bufio.NewScanner(resp.Body)
 	valid := false
+	lineNum := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		lineNum++
+		if debugFirst && lineNum <= 20 {
+			fmt.Fprintf(os.Stderr, "[medialist line %d] %s\n", lineNum, line)
+		}
 		if line == "" {
 			continue
 		}
