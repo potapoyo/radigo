@@ -35,3 +35,7 @@ profile.out
 .envrc
 # archives
 archives/*
+
+radigo
+output/*
+.go-version
