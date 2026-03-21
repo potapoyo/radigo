@@ -160,86 +160,29 @@ func parseMasterM3U8URI(r io.Reader) (string, error) {
 	return "", fmt.Errorf("no URI found in master playlist")
 }
 
-// getTimeshiftChunklist collects all HLS segment URLs for a full timefree program
-// by iterating through seek windows from program start to end.
-// It replaces the single-call approach (getTimeshiftPlaylistM3U8 + GetChunklistFromM3U8)
-// which only returned the first ~windowSeconds of content.
+// getTimeshiftChunklist collects all HLS segment URLs for a full timefree program.
+// The radiko timefree server uses session-based medialists: a single session is
+// created via the master playlist, then the same medialist URL is polled repeatedly.
+// Each poll returns the next window of segments; polling stops on #EXT-X-ENDLIST.
 func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID string, start time.Time) ([]string, error) {
-	prog, err := client.GetProgramByStartTime(ctx, stationID, start)
+	// Get one session's medialist URI via the master playlist.
+	mediaURI, err := getTimeshiftPlaylistM3U8(ctx, client, stationID, start)
 	if err != nil {
 		return nil, err
 	}
 
-	needsAreaFree := client.AreaID() != "" && client.AreaID() != currentAreaID
-	streamType := "b"
-	if needsAreaFree {
-		streamType = "c"
-	}
-	areaID := client.AreaID()
-	if needsAreaFree {
-		areaID = currentAreaID
-	}
-
-	endpoint := discoverTimefreeEndpoint(ctx, client, stationID)
-
-	ftTime, err := time.ParseInLocation(datetimeLayout, prog.Ft, location)
-	if err != nil {
-		return nil, fmt.Errorf("parse ft %q: %w", prog.Ft, err)
-	}
-	toTime, err := time.ParseInLocation(datetimeLayout, prog.To, location)
-	if err != nil {
-		return nil, fmt.Errorf("parse to %q: %w", prog.To, err)
-	}
-
-	// l=15 matches the server's supported window size (15 seconds per request).
-	// Larger values cause the server to return an empty playlist.
-	const windowSecs = 15
-
 	seen := make(map[string]bool)
 	var chunklist []string
+	stalled := 0
 
-	for seek := ftTime; seek.Before(toTime); seek = seek.Add(windowSecs * time.Second) {
-		seekStr := seek.Format(datetimeLayout)
-		masterURL := fmt.Sprintf(
-			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&preroll=2&l=%d&lsid=%s&type=%s",
-			endpoint, stationID,
-			prog.Ft, seekStr,
-			prog.To, prog.To,
-			windowSecs,
-			randomHex(16),
-			streamType,
-		)
-
-		req, err := http.NewRequestWithContext(ctx, "GET", masterURL, nil)
+	for {
+		segs, closed, err := fetchMedialistSegments(ctx, mediaURI)
 		if err != nil {
 			return nil, err
-		}
-		req.Header.Set("X-Radiko-AuthToken", client.AuthToken())
-		req.Header.Set("X-Radiko-AreaId", areaID)
-		req.Header.Set("X-Radiko-App", "pc_html5")
-		req.Header.Set("X-Radiko-App-Version", "0.0.1")
-		req.Header.Set("X-Radiko-User", "test-stream")
-		req.Header.Set("X-Radiko-Device", "pc")
-		req.Header.Set("Origin", "https://radiko.jp")
-		req.Header.Set("Referer", "https://radiko.jp/")
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		mediaURI, parseErr := parseMasterM3U8URI(resp.Body)
-		resp.Body.Close()
-		if parseErr != nil {
-			return nil, fmt.Errorf("window ft=%s: %w", seekStr, parseErr)
-		}
-
-		segments, err := radiko.GetChunklistFromM3U8(mediaURI)
-		if err != nil {
-			return nil, fmt.Errorf("chunklist ft=%s: %w", seekStr, err)
 		}
 
 		newCount := 0
-		for _, seg := range segments {
+		for _, seg := range segs {
 			if !seen[seg] {
 				seen[seg] = true
 				chunklist = append(chunklist, seg)
@@ -247,26 +190,72 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 			}
 		}
 
-		firstSeg := ""
-		if len(segments) > 0 {
-			firstSeg = segments[0]
+		fmt.Fprintf(os.Stderr, "[debug] segs=%d new=%d total=%d closed=%v\n",
+			len(segs), newCount, len(chunklist), closed)
+
+		if closed {
+			break
 		}
-		uriLen := 80
-		if len(mediaURI) < uriLen {
-			uriLen = len(mediaURI)
+
+		if newCount == 0 {
+			stalled++
+			if stalled >= 5 {
+				fmt.Fprintf(os.Stderr, "[debug] stalled, stopping\n")
+				break
+			}
+		} else {
+			stalled = 0
 		}
-		segLen := 80
-		if len(firstSeg) < segLen {
-			segLen = len(firstSeg)
+
+		// Safety cap: ~41 hours worth of 5-second segments
+		if len(chunklist) > 30000 {
+			break
 		}
-		fmt.Fprintf(os.Stderr, "[debug] ft=%s mediaURI=%s segs=%d new=%d first=%s\n",
-			seekStr, mediaURI[:uriLen], len(segments), newCount, firstSeg[:segLen])
 	}
 
 	if len(chunklist) == 0 {
-		return nil, fmt.Errorf("no segments found for %s %s-%s", stationID, prog.Ft, prog.To)
+		return nil, fmt.Errorf("no segments found")
 	}
 	return chunklist, nil
+}
+
+// fetchMedialistSegments fetches a media playlist and returns its segment URLs
+// and whether #EXT-X-ENDLIST was present.
+func fetchMedialistSegments(ctx context.Context, uri string) (segments []string, closed bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	valid := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !valid {
+			if !strings.HasPrefix(line, "#EXTM3U") {
+				return nil, false, fmt.Errorf("invalid medialist: %q", line)
+			}
+			valid = true
+			continue
+		}
+		if line == "#EXT-X-ENDLIST" {
+			closed = true
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		segments = append(segments, line)
+	}
+	return segments, closed, scanner.Err()
 }
 
 func randomHex(n int) string {
