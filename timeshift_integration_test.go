@@ -15,9 +15,18 @@ import (
 
 // Explicitly opt in: this verifies a real recording, requiring network and ffmpeg.
 func TestTBSRecordingIntegration(t *testing.T) {
+	verifyRecordingIntegration(t, "TBS", "20260908010000")
+}
+
+func TestLFRRecordingIntegration(t *testing.T) {
+	verifyRecordingIntegration(t, "LFR", "20260909010000")
+}
+
+func verifyRecordingIntegration(t *testing.T, stationID, startTime string) {
+	t.Helper()
 	dir := os.Getenv("RADIGO_VERIFY_AUDIO_DIR")
 	if dir == "" {
-		t.Skip("set RADIGO_VERIFY_AUDIO_DIR to verify the TBS recording")
+		t.Skip("set RADIGO_VERIFY_AUDIO_DIR to verify the recording")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -28,8 +37,8 @@ func TestTBSRecordingIntegration(t *testing.T) {
 	if _, err := client.AuthorizeToken(ctx); err != nil {
 		t.Fatal(err)
 	}
-	start, _ := time.ParseInLocation(datetimeLayout, "20260908010000", location)
-	links, err := getTimeshiftChunklist(ctx, client, "TBS", start)
+	start, _ := time.ParseInLocation(datetimeLayout, startTime, location)
+	links, err := getTimeshiftChunklist(ctx, client, stationID, start)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +56,7 @@ func TestTBSRecordingIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	final := filepath.Join(dir, "20260908010000-TBS.aac")
+	final := filepath.Join(dir, startTime+"-"+stationID+".aac")
 	if _, err := os.Stat(final); !os.IsNotExist(err) {
 		t.Fatal("verification output already exists")
 	}

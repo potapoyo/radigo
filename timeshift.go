@@ -98,6 +98,11 @@ type timedSegment struct {
 
 const segmentTimeTolerance = 10 * time.Millisecond
 
+// Program schedule boundaries need not align with the first audio timestamp.
+// LFR, for example, starts 26ms after the scheduled second. Only the first
+// segment gets this allowance; gaps within the recording remain strict.
+const programStartTolerance = 100 * time.Millisecond
+
 // Advance only through contiguous audio, never by the requested window length.
 // A repeated URI may represent audio at another time (e.g. inserted content).
 func collectTimeshiftSegments(ctx context.Context, start, end time.Time, fetch func(time.Time) ([]timedSegment, error)) ([]string, error) {
@@ -119,13 +124,26 @@ func collectTimeshiftSegments(ctx context.Context, start, end time.Time, fetch f
 				if s.URI == "" || s.Start.IsZero() || s.Duration <= 0 {
 					return nil, fmt.Errorf("invalid segment timing")
 				}
+				if !s.Start.Before(end) {
+					break
+				}
+				if len(result) == 0 {
+					// Keep a segment covering the program boundary, or starting
+					// just after it, then follow actual audio timestamps.
+					if !s.Start.Add(s.Duration).After(start) {
+						continue
+					}
+					if s.Start.After(start.Add(programStartTolerance)) {
+						break
+					}
+					result = append(result, s.URI)
+					cursor = s.Start.Add(s.Duration)
+					continue
+				}
 				if s.Start.Before(cursor.Add(-segmentTimeTolerance)) {
 					continue
 				}
 				if s.Start.After(cursor.Add(segmentTimeTolerance)) {
-					break
-				}
-				if !s.Start.Before(end) {
 					break
 				}
 				result = append(result, s.URI)

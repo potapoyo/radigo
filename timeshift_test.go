@@ -68,3 +68,53 @@ func TestParseTimedPlaylist(t *testing.T) {
 		}
 	}
 }
+
+func TestCollectTimeshiftProgramBoundary(t *testing.T) {
+	start := time.Date(2026, 9, 9, 1, 0, 0, 0, location)
+	for _, offset := range []time.Duration{26 * time.Millisecond, -26 * time.Millisecond, programStartTolerance} {
+		t.Run(offset.String(), func(t *testing.T) {
+			first := start.Add(offset)
+			calls := 0
+			got, err := collectTimeshiftSegments(context.Background(), start, start.Add(10*time.Second), func(cursor time.Time) ([]timedSegment, error) {
+				calls++
+				if calls == 1 {
+					return []timedSegment{{"old", first.Add(-10 * time.Second), 5 * time.Second}, {"first", first, 5035 * time.Millisecond}}, nil
+				}
+				if !cursor.Equal(first.Add(5035 * time.Millisecond)) {
+					t.Fatalf("cursor=%s", cursor)
+				}
+				return []timedSegment{{"first", first, 5035 * time.Millisecond}, {"second", first.Add(5035 * time.Millisecond), 5035 * time.Millisecond}}, nil
+			})
+			if err != nil || !reflect.DeepEqual(got, []string{"first", "second"}) || calls != 2 {
+				t.Fatalf("got=%v err=%v calls=%d", got, err, calls)
+			}
+		})
+	}
+}
+
+func TestCollectTimeshiftRejectsRealGaps(t *testing.T) {
+	start := time.Date(2026, 9, 9, 1, 0, 0, 0, location)
+	for _, initial := range []bool{true, false} {
+		t.Run(fmt.Sprintf("initial=%v", initial), func(t *testing.T) {
+			calls := 0
+			_, err := collectTimeshiftSegments(context.Background(), start, start.Add(20*time.Second), func(cursor time.Time) ([]timedSegment, error) {
+				calls++
+				if !initial && calls == 1 {
+					return []timedSegment{{"first", start, 5 * time.Second}}, nil
+				}
+				offset := 26 * time.Millisecond
+				if initial {
+					offset = programStartTolerance + time.Millisecond
+				}
+				return []timedSegment{{"after-gap", cursor.Add(offset), 5 * time.Second}}, nil
+			})
+			want := 8
+			if !initial {
+				want = 9
+			}
+			if err == nil || !strings.Contains(err.Error(), "missing audio") || calls != want {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
+	}
+}
