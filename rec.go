@@ -121,7 +121,7 @@ func (c *recCommand) Run(args []string) int {
 	}
 	defer os.RemoveAll(aacDir) // clean up
 
-	if err := internal.BulkDownload(chunklist, aacDir); err != nil {
+	if err := internal.BulkDownloadContext(ctx, chunklist, aacDir); err != nil {
 		c.ui.Error(fmt.Sprintf(
 			"Failed to download aac files: %s", err))
 		return 1

@@ -40,7 +40,11 @@ func (f *ffmpeg) setInput(input string) {
 
 func (f *ffmpeg) run(output string) error {
 	f.setArgs(output)
-	return f.Run()
+	log, err := f.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg: %w: %s", err, log)
+	}
+	return nil
 }
 
 func (f *ffmpeg) start(output string) error {
@@ -112,13 +116,16 @@ func ConcatAACFilesAll(ctx context.Context, files []string, resourcesDir string,
 			fmt.Println("Failed to call ioutil.TempFile")
 			return err
 		}
+		if err := tmpOutputFile.Close(); err != nil {
+			return err
+		}
+		defer os.Remove(tmpOutputFile.Name())
 		err = ConcatAACFiles(ctx, reducedFiles, resourcesDir, tmpOutputFile.Name())
 		if err != nil {
 			fmt.Println("Failed to ConcatAACFiles")
 			return err
 		}
 		err = ConcatAACFilesAll(ctx, append([]string{tmpOutputFile.Name()}, restFiles...), resourcesDir, output)
-		defer os.Remove(tmpOutputFile.Name())
 		return err
 	} else {
 		return ConcatAACFiles(ctx, files, resourcesDir, output)
@@ -131,12 +138,16 @@ func ConcatAACFiles(ctx context.Context, input []string, resourcesDir string, ou
 		return err0
 	}
 	defer os.Remove(listFile.Name())
+	defer listFile.Close()
 
 	for _, f := range input {
 		p := fmt.Sprintf("file '%s'\n", f)
 		if _, err := listFile.WriteString(p); err != nil {
 			return err
 		}
+	}
+	if err := listFile.Close(); err != nil {
+		return err
 	}
 
 	f, err := newFfmpeg(ctx)
@@ -151,8 +162,10 @@ func ConcatAACFiles(ctx context.Context, input []string, resourcesDir string, ou
 	)
 	f.setInput(listFile.Name())
 	f.setArgs("-c", "copy")
-	// TODO: Collect log
 	err = f.run(output)
+	if err != nil {
+		return err
+	}
 	// Remove the intermediate files right after they are concatenated into one file
 	for _, f := range input {
 		defer os.Remove(f)

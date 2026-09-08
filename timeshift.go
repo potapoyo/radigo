@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/grafov/m3u8"
 	"github.com/yyoshiki41/go-radiko"
 )
 
@@ -35,7 +38,7 @@ type stationStreamURL struct {
 }
 
 // getTimeshiftChunklist returns all segment URLs for a timeshifted program.
-// It fetches the program in chunks of maxChunkSec seconds to stay within CDN limits.
+// It follows actual segment timestamps within the CDN's 15-second request limit.
 func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID string, start time.Time) ([]string, error) {
 	prog, err := client.GetProgramByStartTime(ctx, stationID, start)
 	if err != nil {
@@ -68,13 +71,12 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 
 	endpoint := discoverTimefreeEndpoint(ctx, client, stationID)
 
-	var allSegments []string
-	seen := make(map[string]bool)
-
-	for chunkStart := ft; chunkStart.Before(to); chunkStart = chunkStart.Add(timeshiftWindowSec * time.Second) {
-		lsid := randomHex(16)
-		url := fmt.Sprintf(
-			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&preroll=2&l=%d&lsid=%s&type=%s",
+	lsid := randomHex(16)
+	// These are successive seeks through one recording, not new playback starts.
+	// Do not request a fresh preroll for each seek.
+	return collectTimeshiftSegments(ctx, ft, to, func(chunkStart time.Time) ([]timedSegment, error) {
+		link := fmt.Sprintf(
+			"%s?station_id=%s&start_at=%s&ft=%s&end_at=%s&to=%s&preroll=0&l=%d&lsid=%s&type=%s",
 			endpoint,
 			stationID,
 			chunkStart.Format(datetimeLayout), prog.Ft,
@@ -84,25 +86,79 @@ func getTimeshiftChunklist(ctx context.Context, client *radiko.Client, stationID
 			streamType,
 		)
 
-		segments, err := fetchTimeshiftWindow(ctx, client, url, areaID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch chunk starting %s: %w", chunkStart.Format(datetimeLayout), err)
-		}
-
-		for _, seg := range segments {
-			if !seen[seg] {
-				seen[seg] = true
-				allSegments = append(allSegments, seg)
-			}
-		}
-	}
-
-	return allSegments, nil
+		return fetchTimedTimeshiftWindow(ctx, client, link, areaID)
+	})
 }
 
-// fetchTimeshiftWindow fetches one chunk window's segment URLs from the CDN.
-func fetchTimeshiftWindow(ctx context.Context, client *radiko.Client, url, areaID string) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+type timedSegment struct {
+	URI      string
+	Start    time.Time
+	Duration time.Duration
+}
+
+const segmentTimeTolerance = 10 * time.Millisecond
+
+// Advance only through contiguous audio, never by the requested window length.
+// A repeated URI may represent audio at another time (e.g. inserted content).
+func collectTimeshiftSegments(ctx context.Context, start, end time.Time, fetch func(time.Time) ([]timedSegment, error)) ([]string, error) {
+	if !end.After(start) {
+		return nil, fmt.Errorf("invalid program time range")
+	}
+	cursor := start
+	var result []string
+	stalls := 0
+	for cursor.Before(end.Add(-segmentTimeTolerance)) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		segments, err := fetch(cursor)
+		previous := cursor
+		if err == nil {
+			sort.SliceStable(segments, func(i, j int) bool { return segments[i].Start.Before(segments[j].Start) })
+			for _, s := range segments {
+				if s.URI == "" || s.Start.IsZero() || s.Duration <= 0 {
+					return nil, fmt.Errorf("invalid segment timing")
+				}
+				if s.Start.Before(cursor.Add(-segmentTimeTolerance)) {
+					continue
+				}
+				if s.Start.After(cursor.Add(segmentTimeTolerance)) {
+					break
+				}
+				if !s.Start.Before(end) {
+					break
+				}
+				result = append(result, s.URI)
+				cursor = s.Start.Add(s.Duration)
+			}
+		}
+		if cursor.Equal(previous) {
+			stalls++
+			if stalls >= 8 {
+				if err != nil {
+					return nil, fmt.Errorf("playlist retrieval failed at %s: %w", cursor.Format(time.RFC3339Nano), err)
+				}
+				return nil, fmt.Errorf("missing audio at %s after %d attempts", cursor.Format(time.RFC3339Nano), stalls)
+			}
+			timer := time.NewTimer(time.Duration(stalls) * 100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		} else {
+			stalls = 0
+		}
+	}
+	return result, nil
+}
+
+// Keep HTTP errors, timing and relative URIs instead of discarding HLS metadata.
+func fetchTimedTimeshiftWindow(ctx context.Context, client *radiko.Client, link, areaID string) ([]timedSegment, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", link, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +186,67 @@ func fetchTimeshiftWindow(ctx context.Context, client *radiko.Client, url, areaI
 		return nil, err
 	}
 
-	return radiko.GetChunklistFromM3U8(mediaURI)
+	reference, err := url.Parse(mediaURI)
+	if err != nil {
+		return nil, err
+	}
+	mediaURL := resp.Request.URL.ResolveReference(reference)
+	mediaReq, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	mediaResp, err := http.DefaultClient.Do(mediaReq)
+	if err != nil {
+		return nil, err
+	}
+	defer mediaResp.Body.Close()
+	if mediaResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("media playlist request failed: HTTP %d", mediaResp.StatusCode)
+	}
+	return parseTimedPlaylist(mediaResp.Body, mediaResp.Request.URL)
+}
+
+func parseTimedPlaylist(body io.Reader, base *url.URL) ([]timedSegment, error) {
+	p, kind, err := m3u8.DecodeFrom(body, true)
+	if err != nil {
+		return nil, err
+	}
+	if kind != m3u8.MEDIA {
+		return nil, fmt.Errorf("expected media playlist")
+	}
+	var result []timedSegment
+	var next time.Time
+	for _, s := range p.(*m3u8.MediaPlaylist).Segments {
+		if s == nil {
+			continue
+		}
+		if s.Discontinuity {
+			next = time.Time{}
+		}
+		if !s.ProgramDateTime.IsZero() {
+			next = s.ProgramDateTime
+		}
+		if next.IsZero() || s.Duration <= 0 {
+			return nil, fmt.Errorf("missing or invalid segment time")
+		}
+		if s.Key != nil && s.Key.Method != "NONE" {
+			return nil, fmt.Errorf("encrypted audio is not supported")
+		}
+		if s.Map != nil || s.Limit != 0 {
+			return nil, fmt.Errorf("unsupported audio segment format")
+		}
+		u, err := url.Parse(s.URI)
+		if err != nil {
+			return nil, err
+		}
+		duration := time.Duration(s.Duration * float64(time.Second))
+		result = append(result, timedSegment{base.ResolveReference(u).String(), next, duration})
+		next = next.Add(duration)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("empty media playlist")
+	}
+	return result, nil
 }
 
 // discoverTimefreeEndpoint fetches the station stream XML to find the correct
@@ -138,6 +254,8 @@ func fetchTimeshiftWindow(ctx context.Context, client *radiko.Client, url, areaI
 // access for premium members is indicated by type=c in the request, not by
 // the URL. Falls back to the known default on error.
 func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, stationID string) string {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	xmlURL := stationStreamXMLBase + stationID + ".xml"
 	req, err := http.NewRequestWithContext(ctx, "GET", xmlURL, nil)
 	if err != nil {
@@ -151,6 +269,9 @@ func discoverTimefreeEndpoint(ctx context.Context, client *radiko.Client, statio
 		return timefreePlaylistEndpoint
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return timefreePlaylistEndpoint
+	}
 
 	var data stationStreamData
 	if err := xml.NewDecoder(resp.Body).Decode(&data); err != nil {
