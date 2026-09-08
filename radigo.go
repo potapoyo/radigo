@@ -30,7 +30,7 @@ func init() {
 	}
 }
 
-const version = "v0.12.0+pota_2026090801"
+const version = "v0.12.0+pota_2026090901"
 
 // Version returns the app version.
 func Version() string {
